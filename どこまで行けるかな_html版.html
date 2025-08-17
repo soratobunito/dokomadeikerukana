@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+  <title>どこまで行けるかな - HTML版</title>
+  <style>
+    html, body {
+      margin: 0;
+      height: 100%;
+      background: #000;
+      color: #fff;
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans JP", sans-serif;
+      overflow: hidden;
+    }
+    canvas {
+      display: block;
+      width: 100vw;
+      height: 100vh;
+      touch-action: none;
+    }
+    .hint {
+      position: fixed;
+      left: 50%;
+      bottom: 10px;
+      transform: translateX(-50%);
+      font-size: 12px;
+      color: #9aa0a6;
+      user-select: none;
+      pointer-events: none;
+      letter-spacing: 0.03em;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="game"></canvas>
+  <div class="hint">タップ/ドラッグで上下移動・通過で+1・ベストは保存されます</div>
+
+  <script>
+    (() => {
+      const canvas = document.getElementById('game');
+      const ctx = canvas.getContext('2d');
+
+      let dpr = Math.min(window.devicePixelRatio || 1, 2);
+      let W = 0, H = 0;
+
+      const STATE = { READY: 0, PLAYING: 1, OVER: 2 };
+      let state = STATE.READY;
+
+      const player = {
+        x: 0, y: 0, r: 14,
+        targetY: 0,
+        speedFollow: 14,
+      };
+
+      // 難易度・サイズ依存
+      let BASE_GAP = 0, BASE_SPEED = 0, MIN_GAP = 0, MAX_SPEED = 0, OBW = 0, BASE_SPACING = 0;
+      let SPEED_STEP = 0, GAP_STEP = 0;
+      let CUR_GAP = 0, CUR_SPEED = 0;
+
+      function computeParams() {
+        BASE_GAP   = Math.max(140, Math.min(H * 0.28, 220)); // 初期ギャップ
+        BASE_SPEED = Math.max(150, Math.min(W * 0.35, 220)); // 初期速度(px/s)
+        OBW        = Math.max(48, Math.min(W * 0.08, 78));   // 柱幅
+
+        MIN_GAP   = Math.max(70, Math.min(H * 0.15, 140));   // 最小ギャップ
+        MAX_SPEED = BASE_SPEED * 4.0;                        // 上限速度（高速）
+
+        // バー間の目標“距離”（進むほど縮める前提の基準値）
+        BASE_SPACING = Math.max(220, Math.min(W * 0.55, 340));
+
+        // 10点ごとに上げ下げ（DIVISIONS=8なら80点で上限目安）
+        const DIVISIONS = 8;
+        SPEED_STEP = (MAX_SPEED - BASE_SPEED) / DIVISIONS;
+        GAP_STEP   = (BASE_GAP - MIN_GAP)   / DIVISIONS;
+
+        CUR_GAP   = BASE_GAP;
+        CUR_SPEED = BASE_SPEED;
+      }
+
+      // スコア
+      let score = 0;
+      const BEST_KEY = 'needleBest';
+      let best = Number(localStorage.getItem(BEST_KEY) || 0);
+
+      // 障害物
+      /** @type {{x:number, topH:number, bottomH:number, w:number, scored:boolean, cY:number, amp:number, omega:number, phase:number}[]} */
+      let obs = [];
+      let spawnTimer = 0;
+
+      // 入力
+      let pointerActive = false;
+      let pointerY = 0;
+
+      // 時間
+      let last = 0;
+      let rafId = 0;
+
+      function resize() {
+        dpr = Math.min(window.devicePixelRatio || 1, 2);
+        const cssW = window.innerWidth;
+        const cssH = window.innerHeight;
+        canvas.width  = Math.floor(cssW * dpr);
+        canvas.height = Math.floor(cssH * dpr);
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        W = cssW; H = cssH;
+
+        computeParams();
+
+        if (state === STATE.READY) {
+          player.x = W * 0.25;
+          player.y = H * 0.5;
+          player.targetY = player.y;
+        }
+      }
+      window.addEventListener('resize', resize);
+
+      document.addEventListener('visibilitychange', () => {
+        if (document.hidden) cancelAnimationFrame(rafId);
+        else {
+          last = performance.now();
+          rafId = requestAnimationFrame(loop);
+        }
+      });
+
+      function updatePointer(clientY) {
+        const rect = canvas.getBoundingClientRect();
+        const y = (clientY - rect.top) * (H / rect.height);
+        pointerY = clamp(y, 10 + player.r, H - 10 - player.r);
+        player.targetY = pointerY;
+      }
+
+      canvas.addEventListener('pointerdown', (e) => {
+        e.preventDefault();
+        canvas.setPointerCapture(e.pointerId);
+        pointerActive = true;
+        updatePointer(e.clientY);
+
+        if (state === STATE.READY) startGame();
+        else if (state === STATE.OVER) resetToReady();
+      }, { passive: false });
+
+      canvas.addEventListener('pointermove', (e) => {
+        if (!pointerActive) return;
+        updatePointer(e.clientY);
+      });
+
+      canvas.addEventListener('pointerup', (e) => {
+        pointerActive = false;
+        canvas.releasePointerCapture(e.pointerId);
+      });
+
+      window.addEventListener('keydown', (e) => {
+        if (state === STATE.READY && (e.key === ' ' || e.key === 'Enter')) {
+          startGame(); return;
+        }
+        if (state === STATE.OVER && (e.key === ' ' || e.key === 'Enter')) {
+          resetToReady(); return;
+        }
+        if (state === STATE.PLAYING) {
+          if (e.key === 'ArrowUp')   player.targetY = clamp(player.targetY - 40, 10 + player.r, H - 10 - player.r);
+          if (e.key === 'ArrowDown') player.targetY = clamp(player.targetY + 40, 10 + player.r, H - 10 - player.r);
+        }
+      });
+
+      function startGame() {
+        state = STATE.PLAYING;
+        score = 0;
+        spawnTimer = 0;
+        obs = [];
+        player.x = W * 0.25;
+        player.y = H * 0.5;
+        player.targetY = player.y;
+      }
+
+      function resetToReady() {
+        state = STATE.READY;
+        obs = [];
+        spawnTimer = 0;
+        CUR_GAP = BASE_GAP;
+        CUR_SPEED = BASE_SPEED;
+        player.x = W * 0.25;
+        player.y = H * 0.5;
+        player.targetY = player.y;
+      }
+
+      function gameOver() {
+        if (state !== STATE.PLAYING) return;
+        state = STATE.OVER;
+        if (score > best) {
+          best = score;
+          try { localStorage.setItem(BEST_KEY, String(best)); } catch {}
+        }
+      }
+
+      function spawnObstacle() {
+        const minC = CUR_GAP / 2 + 60;
+        const maxC = H - CUR_GAP / 2 - 60;
+
+        const cY = rand(minC, maxC);
+        let topH = H - (cY + CUR_GAP / 2);
+        let bottomH = cY - CUR_GAP / 2;
+
+        // 100通過以降は上下にスイング
+        const moving = (score >= 100);
+        const amp   = moving ? Math.min(60, CUR_GAP * 0.35) : 0; // 振幅(px)
+        const omega = moving ? (Math.PI * 2) * rand(0.25, 0.55) : 0; // rad/sec
+        const phase = moving ? Math.random() * Math.PI * 2 : 0;
+
+        obs.push({ x: W + OBW, topH, bottomH, w: OBW, scored: false, cY, amp, omega, phase });
+      }
+
+      function update(dt) {
+        if (state !== STATE.PLAYING) return;
+
+        // 難易度：10点ごとに上げる
+        const level = Math.floor(score / 10);
+        CUR_SPEED = Math.min(MAX_SPEED, BASE_SPEED + SPEED_STEP * level);
+        CUR_GAP   = Math.max(MIN_GAP,  BASE_GAP   - GAP_STEP   * level);
+
+        // プレイヤー追従
+        const dy = player.targetY - player.y;
+        player.y += dy * Math.min(1, player.speedFollow * dt);
+        player.y = clamp(player.y, 10 + player.r, H - 10 - player.r);
+
+        // 障害物生成（速度が上がっても物理距離は詰まる方向へ）
+        spawnTimer += dt;
+        const frac = Math.min(1, score / 120);                   // 0→120点で1
+        const spacingPx = BASE_SPACING * (1 - 0.35 * frac);      // 最大35%まで圧縮
+        const interval  = spacingPx / CUR_SPEED;                  // 距離→時間
+        if (spawnTimer >= interval) {
+          spawnTimer -= interval;
+          spawnObstacle();
+        }
+
+        // 移動&判定
+        for (let i = 0; i < obs.length; i++) {
+          const o = obs[i];
+          o.x += -CUR_SPEED * dt;
+
+          // 100点以降：隙間スイング（毎フレーム）
+          if (o.amp > 0 && o.omega > 0) {
+            o.phase += o.omega * dt;
+            const center = clamp(
+              o.cY + o.amp * Math.sin(o.phase),
+              CUR_GAP/2 + 10,
+              H - CUR_GAP/2 - 10
+            );
+            o.topH = H - (center + CUR_GAP / 2);
+            o.bottomH = center - CUR_GAP / 2;
+          }
+
+          // スコア（完全通過）
+          if (!o.scored && o.x + o.w < player.x) {
+            o.scored = true;
+            score++;
+          }
+
+          // 当たり判定
+          if (o.topH > 0 && circleRectCollide(player.x, player.y, player.r, o.x, H - o.topH, o.w, o.topH)) {
+            gameOver();
+          }
+          if (o.bottomH > 0 && circleRectCollide(player.x, player.y, player.r, o.x, 0, o.w, o.bottomH)) {
+            gameOver();
+          }
+        }
+
+        // 画面外を削除
+        obs = obs.filter(o => o.x + o.w > -40);
+      }
+
+      function render() {
+        // 背景グラデ
+        const g = ctx.createLinearGradient(0, 0, 0, H);
+        g.addColorStop(0, '#0b0f1a'); g.addColorStop(1, '#000000');
+        ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+
+        // 流れるライン
+        ctx.globalAlpha = 0.06;
+        ctx.fillStyle = '#ffffff';
+        const lineGap = 40;
+        const shift = (performance.now() * 0.04) % lineGap;
+        for (let x = W; x > 0; x -= lineGap) ctx.fillRect(x - shift, 0, 2, H);
+        ctx.globalAlpha = 1;
+
+        // 障害物
+        ctx.fillStyle = '#2ea8ff';
+        for (const o of obs) {
+          if (o.topH > 0)    ctx.fillRect(o.x, H - o.topH, o.w, o.topH);
+          if (o.bottomH > 0) ctx.fillRect(o.x, 0, o.w, o.bottomH);
+        }
+
+        // プレイヤー
+        ctx.beginPath();
+        ctx.fillStyle = '#ffffff';
+        ctx.arc(player.x, player.y, player.r, 0, Math.PI * 2);
+        ctx.fill();
+
+        // スコア/BEST
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'top';
+        ctx.fillStyle = 'rgba(255,255,255,0.95)';
+        ctx.font = '700 36px system-ui, -apple-system, sans-serif';
+        ctx.fillText(String(score), W / 2, 16);
+
+        ctx.font = '500 14px system-ui, -apple-system, sans-serif';
+        ctx.fillStyle = 'rgba(200,200,200,0.9)';
+        ctx.fillText(`BEST: ${best}`, W / 2, 56);
+
+        // メッセージ
+        if (state === STATE.READY || state === STATE.OVER) {
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          ctx.font = '600 22px system-ui, -apple-system, sans-serif';
+          ctx.fillStyle = 'rgba(255,255,255,0.95)';
+          const title = 'どこまで行けるかな';
+          ctx.fillText(title, W / 2, H * 0.35);
+
+          ctx.font = '500 16px system-ui, -apple-system, sans-serif';
+          ctx.fillStyle = 'rgba(220,220,220,0.92)';
+          const msg1 = (state === STATE.READY) ? 'タップで開始 / 上下にドラッグで操作' : 'ゲームオーバー';
+          ctx.fillText(msg1, W / 2, H * 0.35 + 34);
+
+          if (state === STATE.OVER) {
+            ctx.fillText('タップでリトライ', W / 2, H * 0.35 + 58);
+          }
+        }
+      }
+
+      function loop(t) {
+        const now = t || performance.now();
+        const dt = Math.min(0.033, (now - last) / 1000); // 30fps分まで補正
+        last = now;
+        update(dt);
+        render();
+        rafId = requestAnimationFrame(loop);
+      }
+
+      // utils
+      function clamp(v, min, max) { return v < min ? min : (v > max ? max : v); }
+      function rand(min, max) { return Math.random() * (max - min) + min; }
+      function circleRectCollide(cx, cy, cr, rx, ry, rw, rh) {
+        const nx = clamp(cx, rx, rx + rw);
+        const ny = clamp(cy, ry, ry + rh);
+        const dx = cx - nx, dy = cy - ny;
+        return (dx * dx + dy * dy) <= cr * cr;
+      }
+
+      // 起動
+      resize();
+      resetToReady();
+      last = performance.now();
+      rafId = requestAnimationFrame(loop);
+    })();
+  </script>
+</body>
+</html>
